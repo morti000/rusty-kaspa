@@ -36,11 +36,18 @@ use crate::{
         virtual_processor::{errors::PruningImportResult, VirtualStateProcessor},
         ProcessingCounters,
     },
-    processes::window::{WindowManager, WindowType},
+    processes::{
+        ghostdag::ordering::SortableBlock,
+        window::{WindowManager, WindowType},
+    },
 };
 use kaspa_consensus_core::{
     acceptance_data::AcceptanceData,
-    api::{stats::BlockCount, BlockValidationFutures, ConsensusApi, ConsensusStats},
+    api::{
+        args::{TransactionValidationArgs, TransactionValidationBatchArgs},
+        stats::BlockCount,
+        BlockValidationFutures, ConsensusApi, ConsensusStats,
+    },
     block::{Block, BlockTemplate, TemplateBuildMode, TemplateTransactionSelector, VirtualStateApproxId},
     blockhash::BlockHashExtensions,
     blockstatus::BlockStatus,
@@ -49,16 +56,18 @@ use kaspa_consensus_core::{
     errors::{
         coinbase::CoinbaseResult,
         consensus::{ConsensusError, ConsensusResult},
+        difficulty::DifficultyError,
+        pruning::PruningImportError,
         tx::TxResult,
     },
-    errors::{difficulty::DifficultyError, pruning::PruningImportError},
     header::Header,
+    merkle::calc_hash_merkle_root,
     muhash::MuHashExtensions,
     network::NetworkType,
     pruning::{PruningPointProof, PruningPointTrustedData, PruningPointsList},
     trusted::{ExternalGhostdagData, TrustedBlock},
     tx::{MutableTransaction, Transaction, TransactionOutpoint, UtxoEntry},
-    BlockHashSet, BlueWorkType, ChainPath,
+    BlockHashSet, BlueWorkType, ChainPath, HashMapCustomHasher,
 };
 use kaspa_consensus_notify::root::ConsensusNotificationRoot;
 
@@ -74,6 +83,8 @@ use kaspa_muhash::MuHash;
 use kaspa_txscript::caches::TxScriptCacheCounters;
 
 use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
     future::Future,
     iter::once,
     ops::Deref,
@@ -231,7 +242,7 @@ impl Consensus {
             block_processors_pool,
             db.clone(),
             storage.statuses_store.clone(),
-            storage.ghostdag_primary_store.clone(),
+            storage.ghostdag_store.clone(),
             storage.headers_store.clone(),
             storage.block_transactions_store.clone(),
             storage.body_tips_store.clone(),
@@ -418,13 +429,17 @@ impl ConsensusApi for Consensus {
         BlockValidationFutures { block_task: Box::pin(block_task), virtual_state_task: Box::pin(virtual_state_task) }
     }
 
-    fn validate_mempool_transaction(&self, transaction: &mut MutableTransaction) -> TxResult<()> {
-        self.virtual_processor.validate_mempool_transaction(transaction)?;
+    fn validate_mempool_transaction(&self, transaction: &mut MutableTransaction, args: &TransactionValidationArgs) -> TxResult<()> {
+        self.virtual_processor.validate_mempool_transaction(transaction, args)?;
         Ok(())
     }
 
-    fn validate_mempool_transactions_in_parallel(&self, transactions: &mut [MutableTransaction]) -> Vec<TxResult<()>> {
-        self.virtual_processor.validate_mempool_transactions_in_parallel(transactions)
+    fn validate_mempool_transactions_in_parallel(
+        &self,
+        transactions: &mut [MutableTransaction],
+        args: &TransactionValidationBatchArgs,
+    ) -> Vec<TxResult<()>> {
+        self.virtual_processor.validate_mempool_transactions_in_parallel(transactions, args)
     }
 
     fn populate_mempool_transaction(&self, transaction: &mut MutableTransaction) -> TxResult<()> {
@@ -484,7 +499,7 @@ impl ConsensusApi for Consensus {
 
     fn get_virtual_merge_depth_blue_work_threshold(&self) -> BlueWorkType {
         // PRUNE SAFETY: merge depth root is never close to being pruned (in terms of block depth)
-        self.get_virtual_merge_depth_root().map_or(BlueWorkType::ZERO, |root| self.ghostdag_primary_store.get_blue_work(root).unwrap())
+        self.get_virtual_merge_depth_root().map_or(BlueWorkType::ZERO, |root| self.ghostdag_store.get_blue_work(root).unwrap())
     }
 
     fn get_sink(&self) -> Hash {
@@ -493,6 +508,64 @@ impl ConsensusApi for Consensus {
 
     fn get_sink_timestamp(&self) -> u64 {
         self.headers_store.get_timestamp(self.get_sink()).unwrap()
+    }
+
+    fn get_current_block_color(&self, hash: Hash) -> Option<bool> {
+        let _guard = self.pruning_lock.blocking_read();
+
+        // Verify the block exists and can be assumed to have relations and reachability data
+        self.validate_block_exists(hash).ok()?;
+
+        // Verify that the block is in future(source), where Ghostdag data is complete
+        self.services.reachability_service.is_dag_ancestor_of(self.get_source(), hash).then_some(())?;
+
+        let sink = self.get_sink();
+
+        // Optimization: verify that the block is in past(sink), otherwise the search will fail anyway
+        // (means the block was not merged yet by a virtual chain block)
+        self.services.reachability_service.is_dag_ancestor_of(hash, sink).then_some(())?;
+
+        let mut heap: BinaryHeap<Reverse<SortableBlock>> = BinaryHeap::new();
+        let mut visited = BlockHashSet::new();
+
+        let initial_children = self.get_block_children(hash).unwrap();
+
+        for child in initial_children {
+            if visited.insert(child) {
+                let blue_work = self.ghostdag_store.get_blue_work(child).unwrap();
+                heap.push(Reverse(SortableBlock::new(child, blue_work)));
+            }
+        }
+
+        while let Some(Reverse(SortableBlock { hash: decedent, .. })) = heap.pop() {
+            if self.services.reachability_service.is_chain_ancestor_of(decedent, sink) {
+                let decedent_data = self.get_ghostdag_data(decedent).unwrap();
+
+                if decedent_data.mergeset_blues.contains(&hash) {
+                    return Some(true);
+                } else if decedent_data.mergeset_reds.contains(&hash) {
+                    return Some(false);
+                }
+
+                // Note: because we are doing a topological BFS up (from `hash` towards virtual), the first chain block
+                // found must also be our merging block, so hash will be either in blues or in reds, rendering this line
+                // unreachable.
+                kaspa_core::warn!("DAG topology inconsistency: {decedent} is expected to be a merging block of {hash}");
+                // TODO: we should consider the option of returning Result<Option<bool>> from this method
+                return None;
+            }
+
+            let children = self.get_block_children(decedent).unwrap();
+
+            for child in children {
+                if visited.insert(child) {
+                    let blue_work = self.ghostdag_store.get_blue_work(child).unwrap();
+                    heap.push(Reverse(SortableBlock::new(child, blue_work)));
+                }
+            }
+        }
+
+        None
     }
 
     fn get_virtual_state_approx_id(&self) -> VirtualStateApproxId {
@@ -666,6 +739,11 @@ impl ConsensusApi for Consensus {
         self.services.coinbase_manager.modify_coinbase_payload(payload, miner_data)
     }
 
+    fn calc_transaction_hash_merkle_root(&self, txs: &[Transaction], pov_daa_score: u64) -> Hash {
+        let storage_mass_activated = pov_daa_score > self.config.storage_mass_activation_daa_score;
+        calc_hash_merkle_root(txs.iter(), storage_mass_activated)
+    }
+
     fn validate_pruning_proof(&self, proof: &PruningPointProof) -> Result<(), PruningImportError> {
         self.services.pruning_proof_manager.validate_pruning_point_proof(proof)
     }
@@ -812,7 +890,7 @@ impl ConsensusApi for Consensus {
             Some(BlockStatus::StatusInvalid) => return Err(ConsensusError::InvalidBlock(hash)),
             _ => {}
         };
-        let ghostdag = self.ghostdag_primary_store.get_data(hash).unwrap_option().ok_or(ConsensusError::MissingData(hash))?;
+        let ghostdag = self.ghostdag_store.get_data(hash).unwrap_option().ok_or(ConsensusError::MissingData(hash))?;
         Ok((&*ghostdag).into())
     }
 
@@ -864,7 +942,7 @@ impl ConsensusApi for Consensus {
         Ok(self
             .services
             .window_manager
-            .block_window(&self.ghostdag_primary_store.get_data(hash).unwrap(), WindowType::SampledDifficultyWindow)
+            .block_window(&self.ghostdag_store.get_data(hash).unwrap(), WindowType::SampledDifficultyWindow)
             .unwrap()
             .deref()
             .iter()
@@ -903,7 +981,7 @@ impl ConsensusApi for Consensus {
         match start_hash {
             Some(hash) => {
                 self.validate_block_exists(hash)?;
-                let ghostdag_data = self.ghostdag_primary_store.get_data(hash).unwrap();
+                let ghostdag_data = self.ghostdag_store.get_data(hash).unwrap();
                 // The selected parent header is used within to check for sampling activation, so we verify its existence first
                 if !self.headers_store.has(ghostdag_data.selected_parent).unwrap() {
                     return Err(ConsensusError::DifficultyError(DifficultyError::InsufficientWindowData(0)));

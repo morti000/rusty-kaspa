@@ -20,7 +20,12 @@ use kaspa_consensus_core::{
     BlockHashSet, BlockLevel, HashMapCustomHasher,
 };
 use kaspa_consensus_notify::root::ConsensusNotificationRoot;
-use kaspa_core::{info, task::service::AsyncService, task::tick::TickService, time::unix_now, trace, warn};
+use kaspa_core::{
+    info,
+    task::{service::AsyncService, tick::TickService},
+    time::unix_now,
+    trace, warn,
+};
 use kaspa_database::prelude::ConnBuilder;
 use kaspa_database::{create_temp_db, load_existing_db};
 use kaspa_hashes::Hash;
@@ -133,7 +138,13 @@ fn main() {
     let args = Args::parse();
 
     // Initialize the logger
-    kaspa_core::log::init_logger(None, &args.log_level);
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "semaphore-trace")] {
+            kaspa_core::log::init_logger(None, &format!("{},{}=debug", args.log_level, kaspa_utils::sync::semaphore_module_path()));
+        } else {
+            kaspa_core::log::init_logger(None, &args.log_level);
+        }
+    };
 
     // Configure the panic behavior
     // As we log the panic, we want to set it up after the logger
@@ -414,12 +425,12 @@ fn topologically_ordered_hashes(src_consensus: &Consensus, genesis_hash: Hash) -
 }
 
 fn print_stats(src_consensus: &Consensus, hashes: &[Hash], delay: f64, bps: f64, k: KType) -> usize {
-    let blues_mean =
-        hashes.iter().map(|&h| src_consensus.ghostdag_primary_store.get_data(h).unwrap().mergeset_blues.len()).sum::<usize>() as f64
-            / hashes.len() as f64;
-    let reds_mean =
-        hashes.iter().map(|&h| src_consensus.ghostdag_primary_store.get_data(h).unwrap().mergeset_reds.len()).sum::<usize>() as f64
-            / hashes.len() as f64;
+    let blues_mean = hashes.iter().map(|&h| src_consensus.ghostdag_store.get_data(h).unwrap().mergeset_blues.len()).sum::<usize>()
+        as f64
+        / hashes.len() as f64;
+    let reds_mean = hashes.iter().map(|&h| src_consensus.ghostdag_store.get_data(h).unwrap().mergeset_reds.len()).sum::<usize>()
+        as f64
+        / hashes.len() as f64;
     let parents_mean = hashes.iter().map(|&h| src_consensus.headers_store.get_header(h).unwrap().direct_parents().len()).sum::<usize>()
         as f64
         / hashes.len() as f64;

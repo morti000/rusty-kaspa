@@ -118,7 +118,7 @@ impl TestConsensus {
 
     pub fn build_header_with_parents(&self, hash: Hash, parents: Vec<Hash>) -> Header {
         let mut header = header_from_precomputed_hash(hash, parents);
-        let ghostdag_data = self.consensus.services.ghostdag_primary_manager.ghostdag(header.direct_parents());
+        let ghostdag_data = self.consensus.services.ghostdag_manager.ghostdag(header.direct_parents());
         header.pruning_point = self
             .consensus
             .services
@@ -176,7 +176,7 @@ impl TestConsensus {
 
         let cb = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, cb_payload);
         txs.insert(0, cb);
-        header.hash_merkle_root = calc_hash_merkle_root(txs.iter());
+        header.hash_merkle_root = calc_hash_merkle_root(txs.iter(), false);
         MutableBlock::new(header, txs)
     }
 
@@ -201,7 +201,7 @@ impl TestConsensus {
     }
 
     pub fn ghostdag_store(&self) -> &Arc<DbGhostdagStore> {
-        &self.consensus.ghostdag_primary_store
+        &self.consensus.ghostdag_store
     }
 
     pub fn reachability_store(&self) -> &Arc<RwLock<DbReachabilityStore>> {
@@ -233,7 +233,7 @@ impl TestConsensus {
     }
 
     pub fn ghostdag_manager(&self) -> &DbGhostdagManager {
-        &self.consensus.services.ghostdag_primary_manager
+        &self.consensus.services.ghostdag_manager
     }
 }
 
