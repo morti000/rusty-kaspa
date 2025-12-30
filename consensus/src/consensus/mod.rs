@@ -749,6 +749,7 @@ impl ConsensusApi for Consensus {
         // PRUNE SAFETY: retention root is always a current or past pruning point which its header is kept permanently
         let retention_period_root_score = self.headers_store.get_daa_score(self.get_retention_period_root()).unwrap();
         let virtual_score = self.get_virtual_daa_score();
+        // TODO(relaxed): change virtual's 0 daa initialization, and revert to normal subtraction
         let header_count = self
             .headers_store
             .get_daa_score(self.get_headers_selected_tip())
@@ -756,8 +757,8 @@ impl ConsensusApi for Consensus {
             .unwrap()
             .unwrap_or(virtual_score)
             .max(virtual_score)
-            - retention_period_root_score;
-        let block_count = virtual_score - retention_period_root_score;
+            .saturating_sub(retention_period_root_score);
+        let block_count = virtual_score.saturating_sub(retention_period_root_score);
         BlockCount { header_count, block_count }
     }
 
@@ -1425,5 +1426,60 @@ impl ConsensusApi for Consensus {
     fn is_consensus_in_transitional_ibd_state(&self) -> bool {
         let pruning_meta_read = self.pruning_meta_stores.read();
         pruning_meta_read.is_in_transitional_ibd_state()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use kaspa_consensus_core::api::ConsensusApi;
+    use kaspa_consensus_core::{config::params::MAINNET_PARAMS, config::ConfigBuilder};
+    use kaspa_hashes::Hash;
+    use rocksdb::WriteBatch;
+
+    use crate::{
+        consensus::test_consensus::TestConsensus,
+        model::stores::{
+            headers::HeaderStore,
+            virtual_state::{VirtualStateStore, VirtualStateStoreReader},
+        },
+        test_helpers::header_from_precomputed_hash,
+    };
+
+    #[test]
+    fn test_estimate_block_count_does_not_panic_on_underflow() {
+        let config = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().build();
+        let tc = TestConsensus::new(&config);
+        let consensus = tc.consensus_clone();
+
+        let genesis_hash = config.genesis.hash;
+        let retention_period_root = Hash::from_u64_word(1);
+
+        let mut retention_header = header_from_precomputed_hash(retention_period_root, vec![genesis_hash]);
+        retention_header.daa_score = u64::MAX;
+        retention_header.bits = config.genesis.bits;
+        retention_header.timestamp = config.genesis.timestamp;
+        retention_header.blue_score = 0;
+        retention_header.blue_work = Default::default();
+        retention_header.pruning_point = genesis_hash;
+        consensus.headers_store.insert(retention_period_root, Arc::new(retention_header), 0).unwrap();
+
+        {
+            let mut batch = WriteBatch::default();
+            consensus.pruning_point_store.write().set_retention_period_root(&mut batch, retention_period_root).unwrap();
+            consensus.db.write(batch).unwrap();
+        }
+
+        {
+            let mut virtual_write = consensus.virtual_stores.write();
+            let mut state = (*virtual_write.state.get().unwrap()).clone();
+            state.daa_score = 100;
+            virtual_write.state.set(Arc::new(state)).unwrap();
+        }
+
+        let counts = consensus.estimate_block_count();
+        assert_eq!(counts.block_count, 0);
+        assert_eq!(counts.header_count, 0);
     }
 }
