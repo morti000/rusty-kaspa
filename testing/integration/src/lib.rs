@@ -32,6 +32,3 @@ pub mod rpc_perf_benchmarks;
 
 #[cfg(test)]
 pub mod rpc_tests;
-
-#[cfg(test)]
-mod libp2p_tests;

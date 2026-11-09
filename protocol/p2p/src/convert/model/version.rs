@@ -3,8 +3,7 @@ use kaspa_core::{
     kaspad_env::{name, version},
     time::unix_now,
 };
-use kaspa_utils::connection::PeerAddress;
-use kaspa_utils::networking::PeerId;
+use kaspa_utils::networking::{NetAddress, PeerId};
 
 /// Maximum allowed length for the user agent field in a version message `VersionMessage`.
 pub const MAX_USER_AGENT_LEN: usize = 256;
@@ -14,7 +13,7 @@ pub struct Version {
     pub network: String,
     pub services: u64,
     pub timestamp: u64,
-    pub address: Option<PeerAddress>,
+    pub address: Option<NetAddress>,
     pub id: PeerId,
     pub user_agent: String,
     pub disable_relay_tx: bool,
@@ -23,7 +22,7 @@ pub struct Version {
 
 impl Version {
     pub fn new(
-        address: Option<PeerAddress>,
+        address: Option<NetAddress>,
         id: PeerId,
         network: String,
         subnetwork_id: Option<SubnetworkId>,
